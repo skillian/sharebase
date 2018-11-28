@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -509,12 +509,13 @@ func (d *Document) Content(c *Client) (DocumentContent, error) {
 		return DocumentContent{}, errors.Errorf(
 			"%v content has no Content-Length", d)
 	}
-	length, err := strconv.Atoi(lengths[0])
-	if err != nil {
-		return DocumentContent{}, errors.ErrorfWithCause(
-			err, "failed to parse %v length %q to integer: %v",
-			d, lengths[0], err)
+	bigLen := big.NewInt(0)
+	if _, ok := bigLen.SetString(lengths[0], 10); !ok || !bigLen.IsInt64() {
+		return DocumentContent{}, errors.Errorf(
+			"failed to parse %v length %q to integer",
+			d, lengths[0])
 	}
+	length := bigLen.Int64()
 	var contentType string
 	contentTypes := head["Content-Type"]
 	if len(contentTypes) != 0 {
@@ -544,7 +545,7 @@ func (d Document) String() string {
 type DocumentContent struct {
 	*Document
 	io.ReadCloser
-	Length             int
+	Length             int64
 	ContentType        string
 	ContentDisposition string
 }
@@ -560,7 +561,8 @@ func (d DocumentContent) Close() error {
 	return nil
 }
 
-// Len gets the document content's length.
-func (d DocumentContent) Len() int {
+// Len gets the document content's length as an int64 (A normal int isn't large
+// enough on a 32-bit platform for file sizes >2GiB).
+func (d DocumentContent) Len() int64 {
 	return d.Length
 }
