@@ -292,11 +292,21 @@ func (c *Client) requestJSON(method string, uri string, source, target interface
 		}
 		r = bytes.NewBuffer(sourceBytes)
 	}
-	targetBuffer := new(bytes.Buffer)
-	if err := c.request(method, uri, r, targetBuffer, options...); err != nil {
+	var b *bytes.Buffer
+	// using io.Writer so if we don't have to allocate a buffer, then
+	// the interface itself will be nil.
+	var w io.Writer
+	if target != nil {
+		b = new(bytes.Buffer)
+		w = b
+	}
+	if err := c.request(method, uri, r, w, options...); err != nil {
 		return err
 	}
-	return json.Unmarshal(targetBuffer.Bytes(), target)
+	if b != nil {
+		return json.Unmarshal(b.Bytes(), target)
+	}
+	return nil
 }
 
 func (c *Client) requestJSONURL(method string, uri *url.URL, source, target interface{}) error {

@@ -32,6 +32,7 @@ var (
 )
 
 func init() {
+	// logging:
 	h := new(logging.ConsoleHandler)
 	h.SetLevel(logging.DebugLevel)
 	h.SetFormatter(logging.DefaultFormatter{})
@@ -44,7 +45,7 @@ func main() {
 	p := Parameters{}
 
 	flag.StringVar(
-		&p.Config, "Config", "",
+		&p.Config, "Config", "@" + path.Join(os.Getenv("HOME"), "sharebase.conf"),
 		"Combined configuration file")
 	flag.StringVar(
 		&p.DataCenter, "DataCenter", "https://app.sharebase.com/sharebaseapi",
@@ -330,7 +331,7 @@ func getIO(c *web.Client, op oper, v, defaultName string) (io.Closer, error) {
 		case readingOp:
 			return ioutil.NopCloser(os.Stdin), nil
 		case writingOp:
-			return ioutil.NopCloser(os.Stdout), nil
+			return nopWriteCloser{os.Stdout}, nil
 		default:
 			panic(errors.Errorf("invalid operation: %v", op))
 		}
@@ -377,6 +378,12 @@ func getIO(c *web.Client, op oper, v, defaultName string) (io.Closer, error) {
 	}
 }
 
+type nopWriteCloser struct {
+	io.Writer
+}
+
+func (nopWriteCloser) Close() error { return nil }
+
 func getSBFolderAndDocumentName(c *web.Client, pathString string) (f web.Folder, name string, err error) {
 	pathParts := strings.Split(pathString, "/")
 	if len(pathParts) < 2 {
@@ -384,7 +391,12 @@ func getSBFolderAndDocumentName(c *web.Client, pathString string) (f web.Folder,
 			"invalid ShareBase path: %v", pathString)
 		return
 	}
-	lib, err := c.LibraryByName(pathParts[0])
+	libraryName := pathParts[0]
+	// my is shorthand for "My Library:"
+	if libraryName == "my" {
+		libraryName = "My Library"
+	}
+	lib, err := c.LibraryByName(libraryName)
 	if err != nil {
 		return
 	}
