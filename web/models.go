@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -444,7 +445,7 @@ func (w *DocumentWriter) patch() (err error) {
 // createNewLargeDocument posts a request for a temporary file in the folder
 // with the given name.
 func (f *Folder) createNewLargeDocument(c *Client, name string) (r NewLargeDocumentResponse, err error) {
-	err = c.requestJSON(http.MethodPost, Concat(f.Links.Self, "/temp?filename=", name), nil, &r)
+	err = c.requestJSON(http.MethodPost, Concat(f.Links.Self, "/temp?filename=", url.QueryEscape(name)), nil, &r)
 	return
 }
 
