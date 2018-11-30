@@ -1,9 +1,30 @@
 # sharebase
-API and command line tools to interact with Hyland's ShareBase platform
 
-# Sample output
+API and command line tools to interact with Hyland's ShareBase platform.  The
+command is supposed to work similarly to the `scp` command.  I invented a
+ShareBase URI scheme, "sb," that indicates that a source or target is in
+ShareBase.  For example:
 
-Sample output from `sb -h` command:
+```
+sb "my file.txt" sb:my/Documents
+```
+
+Copies the local file, "my file.txt" to the Documents folder in the
+"My Library" ShareBase library ("my" is shorthand for "My Library").
+If the target is a folder, a document is created in the folder with the same
+name as the source.
+
+Libraries other than the "My Library" are also supported.  For example, we have
+an IT Library where we keep downloads of old OnBase versions, so to store a zip
+I have into that library, I write:
+
+```
+sb releaseUnityClient.zip "sb:/IT Library/Installers/OnBase/16.0.0.40"
+```
+
+## Help output
+
+The help output from `sb -h` command:
 
 ```
 Usage of /home/sean/gopath/bin/sb:
@@ -50,3 +71,7 @@ parameter value, for example:
 
 
 ```
+
+## Known Limitations
+
+Check out the Issues to see the current bugs and limitations.
