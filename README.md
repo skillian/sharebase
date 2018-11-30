@@ -19,7 +19,7 @@ an IT Library where we keep downloads of old OnBase versions, so to store a zip
 I have into that library, I write:
 
 ```
-sb releaseUnityClient.zip "sb:/IT Library/Installers/OnBase/16.0.0.40"
+sb releaseUnityClient.zip "sb:IT Library/Installers/OnBase/16.0.0.40"
 ```
 
 ## Help output
