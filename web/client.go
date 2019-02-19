@@ -24,6 +24,7 @@ const (
 var (
 	authenticateURL = url.URL{Path: "api/authenticate"}
 	documentsURL    = url.URL{Path: "api/documents"}
+	foldersURL      = url.URL{Path: "api/folders"}
 	librariesURL    = url.URL{Path: "api/libraries"}
 )
 
@@ -41,6 +42,11 @@ type Client struct {
 	// phoenixToken is a PHOENIX-TOKEN authorization header included in
 	// all requests to the ShareBase API.
 	phoenixToken string
+
+	// numRequests keeps track of the total number of HTTP requests issued
+	// to the ShareBase API.  It's accessible through the NumRequests
+	// function.
+	numRequests uint64
 }
 
 // NewClient creates a new client from the given dataCenter URL string and
@@ -174,6 +180,14 @@ func (c *Client) LibraryByName(name string) (library Library, err error) {
 	return Library{}, NotFound{Kind: LibraryKind, ID: 0, Name: name}
 }
 
+// NumRequests returns the total number of requests issued to the ShareBase API
+// through this client.  It's useful for benchmarking to determine how many
+// queries are consumed in case ShareBase ever switches to a per-request
+// payment model.  This total includes both successful and failed requests.
+func (c *Client) NumRequests() uint64 {
+	return c.numRequests
+}
+
 // requestURL uses a URL when making a request.  Relative URLs are supported.
 func (c *Client) requestURL(method string, uri *url.URL, source io.Reader, target io.Writer) error {
 	if uri == nil {
@@ -220,7 +234,7 @@ func (c *Client) requestBody(method string, uri string, source io.Reader, option
 				o, o, err)
 		}
 	}
-	if logger.Level() <= logging.DebugLevel {
+	if logger.Level() <= logging.VerboseLevel {
 		buffer := bytes.Buffer{}
 		if err = req.Write(&buffer); err != nil {
 			return nil, nil, err
@@ -232,9 +246,13 @@ func (c *Client) requestBody(method string, uri string, source io.Reader, option
 		} else {
 			bufferString = string(bufferBytes)
 		}
-		logger.Debug2("request (%d bytes total):\n\n%v", len(bufferBytes), bufferString)
+		logger.Log2(
+			logging.VerboseLevel,
+			"request (%d bytes total):\n\n%v",
+			len(bufferBytes), bufferString)
 	}
 	res, err := c.httpClient.Do(req)
+	c.numRequests++
 	if err != nil {
 		return nil, nil, errors.ErrorfWithCause(
 			err,
@@ -300,6 +318,7 @@ func (c *Client) requestJSON(method string, uri string, source, target interface
 		b = new(bytes.Buffer)
 		w = b
 	}
+	options = append(options, setContentType("application/json"))
 	if err := c.request(method, uri, r, w, options...); err != nil {
 		return err
 	}
