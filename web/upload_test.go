@@ -35,7 +35,7 @@ var (
 )
 
 const (
-	configFilename = "/home/sean/Dropbox/dev/go/src/github.com/skillian/sharebase/web/config.json"
+	configFilename = "/home/sean/.sharebase-config.json"
 
 	libraryName  = "My Library"
 	folderName   = "Test"
@@ -151,9 +151,9 @@ func TestDownload(t *testing.T) {
 		"content disposition:", content.ContentDisposition)
 
 	buf := make([]byte, content.Length)
-	for i := 0; i < content.Length; {
+	for i := int64(0); i < content.Length; {
 		n, err := content.Read(buf[i:])
-		i += n
+		i += int64(n)
 		if err != nil {
 			if err == io.EOF {
 				continue

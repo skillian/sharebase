@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -76,7 +77,9 @@ func (lib *Library) Folders(c *Client) (folders []Folder, err error) {
 
 // Folder gets a folder by ID from the given library.
 func (lib *Library) Folder(c *Client, id int) (folder Folder, err error) {
-	uriString := lib.Links.Folders + fmt.Sprintf("/%d?embed=d,f", id)
+	url := c.DataCenter
+	url.Path = path.Join(url.Path, foldersURL.Path)
+	uriString := fmt.Sprintf("%v/%d?embed=d,f", url.String(), id)
 	err = c.requestJSON(http.MethodGet, uriString, nil, &folder)
 	if _, ok := err.(NotFound); ok {
 		return Folder{}, NotFound{Kind: FolderKind, ID: id, Name: ""}
@@ -204,7 +207,9 @@ func (f *Folder) Folders(c *Client) (folders []Folder, err error) {
 
 // Folder gets a single folder within the current folder by its ID.
 func (f *Folder) Folder(c *Client, id int) (folder Folder, err error) {
-	uriString := f.Links.Folders + fmt.Sprintf("/%d?embed=d,f", id)
+	url := c.DataCenter
+	url.Path = path.Join(url.Path, foldersURL.Path)
+	uriString := fmt.Sprintf("%v/%d?embed=d,f", url.String(), id)
 	err = c.requestJSON(http.MethodGet, uriString, nil, &folder)
 	if _, ok := err.(NotFound); ok {
 		return Folder{}, NotFound{Kind: FolderKind, ID: id, Name: ""}

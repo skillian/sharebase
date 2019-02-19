@@ -1,14 +1,16 @@
 package main
 
 import (
+	"archive/tar"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/url"
+	"math"
 	"os"
+	"os/user"
 	"path"
-	"reflect"
 	"strings"
 
 	"github.com/skillian/sharebase/web"
@@ -18,90 +20,68 @@ import (
 )
 
 const (
-	ShareBaseSchemePrefix = "sb:"
+	defaultConfigFilename = ".sharebase-config.json"
+
+	shareBaseURIScheme = "sb:"
 )
 
 var (
+	programName = path.Base(os.Args[0])
+
+	my = mustGetCurrentUser()
+
+	defaultUsage = flag.Usage
+
 	logger = logging.GetLogger("github.com/skillian/sharebase")
-
-	// stdinURL is a placeholder URL for standard input.
-	stdinURL = new(url.URL)
-
-	// stdoutURL is a placeholder URL for standard output.""
-	stdoutURL = new(url.URL)
 )
 
 func init() {
-	// logging:
 	h := new(logging.ConsoleHandler)
-	h.SetLevel(logging.DebugLevel)
+	h.SetLevel(math.MinInt32)
 	h.SetFormatter(logging.DefaultFormatter{})
 	logger.AddHandler(h)
 }
 
-// main is responsible for parsing the command line arguments and running
-// the Run command
 func main() {
-	p := Parameters{}
+	s := state{}
+
+	var configFilename, logLevelString string
 
 	flag.StringVar(
-		&p.Config, "Config", "@" + path.Join(os.Getenv("HOME"), "sharebase.conf"),
-		"Combined configuration file")
-	flag.StringVar(
-		&p.DataCenter, "DataCenter", "https://app.sharebase.com/sharebaseapi",
-		"The ShareBase data center to connect to.\n")
-	flag.StringVar(
-		&p.Username, "Username", "",
-		"The username used to establish a connection to the data center.")
-	flag.StringVar(
-		&p.Password, "Password", "",
-		"The password used to connect to ShareBase.")
-	flag.StringVar(
-		&p.Token, "Token", "",
-		"The ShareBase authentication token included in all requests.  Using a token\n"+
-			"precludes the use of a username and password and vice-versa.")
+		&configFilename, "c",
+		path.Join(my.HomeDir, defaultConfigFilename),
+		"ShareBase configuration file")
 
-	logLevelString := flag.String("LogLevel", "Warn", "Logging level")
+	flag.StringVar(
+		&logLevelString, "l", "",
+		"Logging level (useful for debugging)")
 
-	defaultUsage := flag.Usage
+	flag.BoolVar(
+		&s.Tar, "t", false,
+		"Write the source file(s) out into a tar instead of "+
+			"individual files (useful for piping them to another "+
+			"command).")
+
+	flag.BoolVar(
+		&s.Untar, "u", false,
+		"Untar the input to write the files separately into "+
+			"ShareBase (useful if the source is coming from a "+
+			"stream).")
 
 	flag.Usage = func() {
 		defaultUsage()
 		fmt.Printf(`
 Positional parameters:
-  [Source] string
+  [source] string
         The source file to read from.  Can be either a ShareBase URL or a local
         path.
-  [Target] string
+  [target] string
         The target file to write to.  Can be either a ShareBase URL or a local
-        path.
-
-All of the variables can reference a configuration file instead of an actual
-value by prefixing the parameter value with an @.  For example, if the password
-is in a text file, the password can be specified as:
-
-    -Password @password_file.txt
-
-To load the password from a file called "password_file.txt" instead of putting
-the actual value on the command line.
-
-If a single configuration file is used with the Config parameter, the parameters
-within the file must each be on their own line and prefixed with the command
-line argument (e.g. "DataCenter", etc.), then an equals sign ("=") and then the
-parameter value, for example:
-
-    DataCenter = https://app.sharebase.com/sharebaseapi
-    Username   = MyUsername@email.com
-    Password   = My Sup3r S#cret P@ssw0rd
-
+	path.
 `)
 	}
 
 	flag.Parse()
-
-	if logLevel, ok := logging.ParseLevel(*logLevelString); ok {
-		logger.SetLevel(logLevel)
-	}
 
 	args := flag.Args()
 
@@ -109,320 +89,379 @@ parameter value, for example:
 	case 0:
 		die(errors.Errorf("Source must be specified"))
 	case 1:
-		p.SourceName = args[0]
-		p.TargetName = path.Base(p.SourceName)
+		s.Source = args[0]
+		s.Target = path.Base(s.Source)
 	case 2:
-		p.SourceName = args[0]
-		p.TargetName = args[1]
+		s.Source = args[0]
+		s.Target = args[1]
 	default:
-		die(errors.Errorf("Too many additional arguments specified!"))
+		die(errors.Errorf("Too many arguments specified!"))
 	}
 
-	if err := p.Main(); err != nil {
-		die(err)
+	dieOnError(loadJSONConfig(configFilename, &s.Config))
+
+	if level, ok := logging.ParseLevel(logLevelString); ok {
+		logger.SetLevel(level)
+	}
+
+	dieOnError(s.execute())
+}
+
+// Config is configuration that is specified inside of a JSON file.
+type Config struct {
+	DataCenter string `json:"dataCenter"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	Token      string `json:"token"`
+}
+
+type state struct {
+	*web.ClientPool
+	*Root
+	Config
+
+	Source string
+	Target string
+
+	Tar   bool
+	Untar bool
+}
+
+func (s *state) client() (*web.Client, error) {
+	return s.ClientPool.Client(
+		s.Config.DataCenter, s.Config.Token)
+}
+
+func (s *state) init() error {
+	if s.Config.Username != "" {
+		logger.Debug1(
+			"Config w/ username %q specified.  Creating token...",
+			s.Config.Username)
+		tok, err := web.AuthTokenForUsernameAndPassword(
+			s.Config.DataCenter, s.Username, s.Password)
+		if err != nil {
+			return errors.ErrorfWithCause(
+				err,
+				"failed to create ShareBase authorization "+
+					"token for username: %v: %v",
+				s.Config.Username, err)
+		}
+		logger.Debug2(
+			"Token for username %q: %v",
+			s.Config.Username, tok.Token)
+		s.Config.Token = tok.Token
+	}
+	s.ClientPool = web.NewClientPool()
+	s.Root = NewRoot()
+	return nil
+}
+
+func (s *state) execute() error {
+	var err error
+	if err = s.init(); err != nil {
+		return err
+	}
+	c, err := s.client()
+	if err != nil {
+		return err
+	}
+	if isShareBaseLoc(s.Source) {
+		if isShareBaseLoc(s.Target) {
+			return errors.Errorf(
+				"ShareBase -> ShareBase is not yet supported.")
+		}
+		if s.Untar {
+			return errors.Errorf(
+				"cannot untar from ShareBase source.")
+		}
+		p, base, err := s.Root.ParentByPath(c, nil, ShareBasePath(s.Source))
+		if err != nil {
+			return err
+		}
+		return s.shareBaseToLocal(c, p, base)
+	}
+	if isShareBaseLoc(s.Target) {
+		if isShareBaseLoc(s.Source) {
+			return errors.Errorf(
+				"ShareBase -> ShareBase is not yet supported.")
+		}
+		if s.Tar {
+			return errors.Errorf("cannot tar to ShareBase target.")
+		}
+		path := ShareBasePath(s.Target)
+		logger.Debug("Path: %v", path)
+		p, base, err := s.Root.ParentByPath(c, nil, path)
+		if err != nil {
+			return err
+		}
+		return s.localToShareBase(c, p, base)
+	}
+	return errors.Errorf(
+		"do not use this client for local -> local transfers.")
+}
+
+func (s *state) localToShareBase(wc *web.Client, p Parent, name string) (err error) {
+	//logger.Debug2("parent: %v, name: %q", PathOf(p), name)
+	var source *os.File
+	if s.Source == "" || s.Source == "-" {
+		source = os.Stdin
+	} else {
+		source, err = os.Open(s.Source)
+		if err != nil {
+			return err
+		}
+		defer errors.WrapDeferred(&err, source.Close)
+	}
+	st, err := source.Stat()
+	if err != nil {
+		return errors.Errorf(
+			"failed to stat source: %v: %v", s.Source, err)
+	}
+	if source != os.Stdin {
+		// Don't try the if-dir-exists behavior if we're reading
+		// from stdin.
+		if c, err := s.Root.ObjectByPath(wc, p, ShareBasePath(name)); err == nil {
+			logger.Debug2("parent %q has child %q", PathOf(p), name)
+			if c, ok := c.(Parent); ok {
+				logger.Debug1("child %q is itself a parent", PathOf(c))
+				p = c
+				name = path.Base(source.Name())
+			}
+		}
+	}
+	if st.IsDir() {
+		if s.Untar {
+			return errors.Errorf(
+				"cannot untar source directory: %v",
+				s.Source)
+		}
+		return s.localDirToShareBaseDir(wc, source, p, name)
+	}
+	if s.Untar {
+		return s.localTarToShareBaseDir(wc, source, p, name)
+	}
+	f, ok := p.(*Folder)
+	if !ok {
+		return errors.Errorf(
+			"files can only be uploaded into folders, not %T", p)
+	}
+	if err != nil {
+		return err
+	}
+	err = s.localFileToShareBaseDir(wc, source, f, name)
+	return err
+}
+
+// localDirToShareBaseDir copies a local directory into a ShareBase directory.
+//
+// Currently, it uses recursion, so this could be a problem for very deep
+// folder structures.
+func (s *state) localDirToShareBaseDir(wc *web.Client, source *os.File, p Parent, name string) error {
+	logger.Debug2("parent: %v, name: %q", PathOf(p), name)
+	f, err := s.Root.GetOrCreateFolder(wc, p, ShareBasePath(name))
+	if err != nil {
+		return errors.ErrorfWithCause(
+			err, "failed to create ShareBase folder")
+	}
+	for {
+		infos, err := source.Readdir(128)
+		if err != nil && err != io.EOF {
+			return errors.ErrorfWithCause(
+				err,
+				"failed to read local directory: %v: %v:",
+				source.Name(), err)
+		}
+		for _, fi := range infos {
+			name := fi.Name()
+			file, err := os.Open(path.Join(source.Name(), name))
+			name = path.Base(name)
+			if err != nil {
+				return err
+			}
+			if fi.IsDir() {
+				err = s.localDirToShareBaseDir(wc, file, f, name)
+			} else {
+				err = s.localFileToShareBaseDir(wc, file, f, name)
+			}
+			if err != nil {
+				return err
+			}
+			if err = file.Close(); err != nil {
+				return err
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+	return nil
+}
+
+func (s *state) localFileToShareBaseDir(c *web.Client, r io.Reader, f *Folder, name string) error {
+	logger.Info2("copying %v to %v...", name, PathOf(f))
+	// Don't need to worry about updating Root.  It'll find out about the
+	// new document the next time it's refreshed.  No need to rack up
+	// possibly unecessary requests.  Plus, we don't know what the
+	// new doc's ID is without re-requesting from the API.
+	return f.Folder.NewDocument(c, name, r)
+}
+
+func (s *state) localTarToShareBaseDir(wc *web.Client, r io.Reader, origin Parent, name string) error {
+	f, err := s.Root.GetOrCreateFolder(wc, origin, ShareBasePath(name))
+	if err != nil {
+		return errors.ErrorfWithCause(
+			err, "failed to create ShareBase folder")
+	}
+	t := tar.NewReader(r)
+	for {
+		h, err := t.Next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return errors.ErrorfWithCause(
+				err, "failure while reading tar")
+		}
+		switch h.Typeflag {
+		case tar.TypeDir:
+			_, err = s.Root.GetOrCreateFolder(wc, f, LocalPath(h.Name))
+			if err != nil {
+				return errors.ErrorfWithCause(
+					err,
+					"failed to create subdirectory")
+			}
+		case tar.TypeReg:
+			path := LocalPath(h.Name)
+			f2, err := s.Root.GetOrCreateFolder(wc, f, path.Dir())
+			if err != nil {
+				return errors.ErrorfWithCause(
+					err,
+					"failed to get target directory %v: %v",
+					path.Dir(), err)
+			}
+			err = s.localFileToShareBaseDir(wc, t, f2, path.Name())
+			if err != nil {
+				return errors.ErrorfWithCause(
+					err,
+					"failed to write contents of tar "+
+						"into ShareBase Document: %v",
+					err)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *state) shareBaseToLocal(wc *web.Client, p Parent, name string) (err error) {
+	var o Object
+	o, err = s.Root.ObjectByPath(wc, p, ShareBasePath(name))
+	if err != nil {
+		return errors.ErrorfWithCause(
+			err,
+			"failed to get source ShareBase document or folder.")
+	}
+	p2, ok := o.(Parent)
+	target, err := s.getLocalTarget(ok && !s.Tar, name)
+	defer errors.WrapDeferred(&err, target.Close)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if s.Tar {
+			return s.shareBaseDirToLocalTar(wc, p2)
+		}
+		return s.shareBaseDirToLocalDir(wc, p2, target.Name())
+	}
+	return s.shareBaseFileToLocalFile(wc, o, target)
+}
+
+func (s *state) shareBaseDirToLocalDir(wc *web.Client, p Parent, target *os.File) error {
+	for _, c := range p.Children() {
+		switch c := c.(type) {
+		case Parent:
+
+		}
 	}
 }
 
-func dieOnError(f func() error) {
-	if err := f(); err != nil {
-		die(err)
+// getLocalTarget gets the local target file or directory.
+func (s *state) getLocalTarget(container bool, name string) (*os.File, error) {
+	if s.Target == "" || s.Target == "-" {
+		return os.Stdout, nil
 	}
+	st, err := os.Stat(s.Target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if container {
+				if err = os.Mkdir(s.Target, 0777); err != nil {
+					return nil, errors.ErrorfWithCause(
+						err,
+						"failed to create target directory "+
+							"%q: %v",
+						s.Target, err)
+				}
+				return os.Open(s.Target)
+			}
+			return os.Create(s.Target)
+		}
+		return nil, errors.ErrorfWithCause(
+			err,
+			"failed to get statistics on file %q: %v",
+			s.Target, err)
+	}
+	if st.IsDir() {
+		s.Target = path.Join(s.Target, name)
+	}
+	return os.Create(s.Target)
 }
 
+// die reports the given error and terminates the program with a non-0 return
+// code.
 func die(err error) {
 	logger.LogErr(err)
 	os.Exit(-1)
 }
 
-// Parameters is a collection of ShareBase parameters.
-type Parameters struct {
-	web.Client
-	state
-	Config     string
-	DataCenter string
-	Username   string
-	Password   string
-	Token      string
-
-	// SourceName is the name of the source specified on the command line.
-	SourceName string
-
-	// TargetName is the name of the source specified on the command line.
-	TargetName string
+// dieOnError calls die if the given error is not nil.
+func dieOnError(err error) {
+	if err != nil {
+		die(err)
+	}
 }
 
-// Init canonicalizes the Parameters.
-func (p *Parameters) Init() (err error) {
-	// The functions called by Init are expected to use the
-	// github.com/skillian/errors package to produce full error stack traces.
-	if err = p.initConfig(); err != nil {
-		return
-	}
-	if err = p.initDataCenter(); err != nil {
-		return
-	}
-	if err = p.initUserPass(); err != nil {
-		return
-	}
-	if err = p.initToken(); err != nil {
-		return
-	}
-	client, err := web.NewClient(p.DataCenter, p.Token)
-	if err != nil {
-		return
-	}
-	p.Client = *client
-	closer, err := getIO(&p.Client, readingOp, p.SourceName, "")
-	if err != nil {
-		return
-	}
-	p.source = closer.(io.ReadCloser)
-	closer, err = getIO(&p.Client, writingOp, p.TargetName, path.Base(p.SourceName))
-	if err != nil {
-		return
-	}
-	p.target = closer.(io.WriteCloser)
-	return
+func isShareBaseLoc(v string) bool {
+	return strings.HasPrefix(v, shareBaseURIScheme)
 }
 
-// Main is an indirection from the main function so that errors from deferred
-// functions are easily captured.
-func (p *Parameters) Main() (err error) {
-	if err = p.Init(); err != nil {
-		die(errors.ErrorfWithCause(
-			err, "failed to initialize parameters: %v", err))
-	}
-
-	defer errors.WrapDeferred(&err, p.source.Close)
-	defer errors.WrapDeferred(&err, p.target.Close)
-
-	_, err = io.Copy(p.target, p.source)
-	return err
-}
-
-func (p *Parameters) initConfig() (err error) {
-	p.Config, err = GetStringOf(p.Config)
+func loadJSONConfig(filename string, c *Config) (err error) {
+	const loadJSONConfigErrFmt = "failed to %v JSON configuration file: %v"
+	f, err := os.Open(filename)
 	if err != nil {
 		return errors.ErrorfWithCause(
-			err, "failed to read config: %v:\n%v", p.Config, err)
+			err,
+			loadJSONConfigErrFmt, "open", err)
 	}
-	if p.Config == "" {
-		return nil
+	defer errors.WrapDeferred(&err, f.Close)
+	data, err := ioutil.ReadAll(f)
+	if err != nil {
+		return errors.ErrorfWithCause(
+			err,
+			loadJSONConfigErrFmt, "read", err)
 	}
-	config := strings.Split(p.Config, "\n")
-	params := make([][2]string, 0, len(config))
-	for _, line := range config {
-		line = strings.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		index := strings.Index(line, "=")
-		if index == -1 {
-			return errors.Errorf(
-				"no equals sign in configuration line: %v", line)
-		}
-		params = append(params, [...]string{
-			strings.TrimSpace(line[:index]),
-			strings.TrimSpace(line[index+len("="):]),
-		})
-	}
-	// using reflection here in case the field names change in the future:
-	v := reflect.ValueOf(p)
-	for _, param := range params {
-		f := v.Elem().FieldByName(param[0])
-		if !f.IsValid() {
-			return errors.Errorf("unrecognized field: %q", param[0])
-		}
-		f.SetString(param[1])
+	if err = json.Unmarshal(data, c); err != nil {
+		return errors.ErrorfWithCause(
+			err,
+			loadJSONConfigErrFmt, "parse", err)
 	}
 	return nil
 }
 
-func (p *Parameters) initDataCenter() (err error) {
-	p.DataCenter, err = GetStringOf(p.DataCenter)
-	return
-}
-
-func (p *Parameters) initUserPass() (err error) {
-	p.Username, err = GetStringOf(p.Username)
+func mustGetCurrentUser() *user.User {
+	u, err := user.Current()
 	if err != nil {
-		return errors.ErrorfWithCause(
-			err, "failed to load %v from parameters: %v", "Username", err)
+		panic(errors.ErrorfWithCause(
+			err,
+			"failed to get current user: %v", err))
 	}
-	p.Password, err = GetStringOf(p.Password)
-	return err
-}
-
-// initToken expects the DataCenter to be initialized.
-func (p *Parameters) initToken() (err error) {
-	p.Token, err = GetStringOf(p.Token)
-	if err != nil {
-		return err
-	}
-	if p.Token == "" {
-		authToken, err := web.AuthTokenForUsernameAndPassword(
-			p.DataCenter, p.Username, p.Password)
-		if err != nil {
-			return err
-		}
-		p.Token = authToken.Token
-	}
-	return nil
-}
-
-// GetStringOf gets a string from a given parameter value.  If the value starts
-// with an "@", then the value is treated as a filename and opened and read
-// to get a string value.  If the value doesn't start with an "@", then the
-// value itself is returned.
-func GetStringOf(p string) (v string, err error) {
-	if len(p) == 0 {
-		return "", nil
-	}
-	if p[0] == '@' {
-		file, err := os.Open(p[1:])
-		if err != nil {
-			return "", errors.ErrorfWithCause(
-				err, "failed to open %q for reading: %v", p, err)
-		}
-		defer errors.WrapDeferred(&err, file.Close)
-		var b []byte
-		b, err = ioutil.ReadAll(file)
-		if err != nil {
-			return "", errors.ErrorfWithCause(
-				err, "failed to read file %q: %v", file.Name(), err)
-		}
-		return string(b), nil
-	}
-	return p, nil
-}
-
-// getURL converts a string to a URL.  If the string fails to parse as a URL,
-// "file:" is prefixed to it and the result is re-parsed.
-func getURL(v string) (uri *url.URL, err error) {
-	uri, err = url.Parse(v)
-	if err == nil {
-		return
-	}
-	if urlerr, ok := err.(*url.Error); ok {
-		if urlerr.Op == "parse" {
-			return url.Parse("file:" + v)
-		}
-	}
-	return nil, err
-}
-
-type state struct {
-	source io.ReadCloser
-	target io.WriteCloser
-}
-
-type oper int
-
-const (
-	invalidOp oper = iota
-	readingOp
-	writingOp
-)
-
-func getIO(c *web.Client, op oper, v, defaultName string) (io.Closer, error) {
-	if v == "-" {
-		// piping from/to stdin/stdout:
-		switch op {
-		case readingOp:
-			return ioutil.NopCloser(os.Stdin), nil
-		case writingOp:
-			return nopWriteCloser{os.Stdout}, nil
-		default:
-			panic(errors.Errorf("invalid operation: %v", op))
-		}
-	}
-	if strings.HasPrefix(v, ShareBaseSchemePrefix) {
-		// is a ShareBase source or target:
-		f, name, err := getSBFolderAndDocumentName(c, v[len(ShareBaseSchemePrefix):])
-		if err != nil {
-			return nil, err
-		}
-		if name == "" {
-			name = defaultName
-		}
-		if name == "" {
-			return nil, errors.Errorf(
-				"document or file name cannot be empty")
-		}
-		switch op {
-		case readingOp:
-			d, err := f.DocumentByName(c, name)
-			if err != nil {
-				return nil, err
-			}
-			return d.Content(c)
-		case writingOp:
-			return f.DocumentWriter(c, name)
-		default:
-			panic(errors.Errorf("invalid operation: %v", op))
-		}
-	}
-	switch op {
-	case readingOp:
-		return os.Open(v)
-	case writingOp:
-		if fi, err := os.Stat(v); !os.IsNotExist(err) {
-			if fi.IsDir() {
-				v = path.Join(v, defaultName)
-			}
-			logger.Warn1("%q will be overwritten", v)
-		}
-		return os.Create(v)
-	default:
-		panic(errors.Errorf("invalid operation: %v", op))
-	}
-}
-
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (nopWriteCloser) Close() error { return nil }
-
-func getSBFolderAndDocumentName(c *web.Client, pathString string) (f web.Folder, name string, err error) {
-	pathParts := strings.Split(pathString, "/")
-	if len(pathParts) < 2 {
-		err = errors.Errorf(
-			"invalid ShareBase path: %v", pathString)
-		return
-	}
-	libraryName := pathParts[0]
-	// my is shorthand for "My Library:"
-	if libraryName == "my" {
-		libraryName = "My Library"
-	}
-	lib, err := c.LibraryByName(libraryName)
-	if err != nil {
-		return
-	}
-	f, err = lib.FolderByName(c, pathParts[1])
-	if err != nil {
-		return
-	}
-	lastIndex := len(pathParts) - 1
-	if lastIndex >= 2 {
-		for _, name = range pathParts[2:lastIndex] {
-			f, err = f.FolderByName(c, name)
-			if err != nil {
-				return
-			}
-		}
-	}
-
-	lastName := pathParts[lastIndex]
-
-	f2, err := f.FolderByName(c, lastName)
-	if _, ok := err.(web.NotFound); ok {
-		// The last part must be the name of a document.
-		return f, lastName, nil
-	}
-
-	// else f2 is a folder that exists and the new name should be the same name
-	// as the source.
-	return f2, "", nil
+	return u
 }
