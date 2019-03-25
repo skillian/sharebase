@@ -62,11 +62,12 @@ func NewClient(dataCenter, token string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{
+	c := &Client{
 		httpClient:   http.Client{},
 		DataCenter:   *dataCenterURL,
 		phoenixToken: PhoenixTokenPrefix + token,
-	}, nil
+	}
+	return c, nil
 }
 
 // AuthToken is the structure returned when authenticating with a username and
@@ -260,12 +261,22 @@ func (c *Client) requestBody(method string, uri string, source io.Reader, option
 			uri, err)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		if res.StatusCode == 404 {
+		switch res.StatusCode {
+		case 401:
+			// TODO(skillian): Eventually wrap this function to
+			// re-authenticate when this error is returned and
+			// then retry.
+			return nil, nil, ErrUnauthorized
+		case 404:
 			// The caller must check if the result is NotFound and populate the
 			// fields.
 			return nil, nil, NotFound{}
+		default:
+			return nil, nil, statusError{
+				code: res.StatusCode,
+				msg:  res.Status,
+			}
 		}
-		return nil, nil, statusError{code: res.StatusCode, msg: res.Status}
 	}
 	return res.Header, res.Body, nil
 }

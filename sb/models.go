@@ -65,13 +65,13 @@ func (r *Root) ParentByPath(c *web.Client, origin Parent, path Path) (p Parent, 
 		return nil, "", errors.Errorf(
 			"object %v exists but is not a parent", path)
 	}
-	return p, path.Name(), nil
+	return p, Basename(path), nil
 }
 
 // GetOrCreateFolder attempts to get an existing folder with the given path
 // but creates it if necessary.
 func (r *Root) GetOrCreateFolder(c *web.Client, origin Parent, path Path) (f *Folder, err error) {
-	logger.Debug2("origin: %q, path: %q", PathOf(origin), path)
+	logger.Debug2("origin: %#v, path: %#v", PathOf(origin), path)
 	o, err := r.ObjectByPath(c, origin, path)
 	if err == nil {
 		f, ok := o.(*Folder)
@@ -83,17 +83,14 @@ func (r *Root) GetOrCreateFolder(c *web.Client, origin Parent, path Path) (f *Fo
 		return nil, errors.ErrorfWithCause(
 			err,
 			"error while checking for existing folder %v",
-			path.Name())
+			Basename(path))
 	}
-	fullPath := path
-	if origin != nil && origin != r {
-		fullPath = append(PathOf(origin), fullPath...)
-	}
-	lib, err := r.LibraryByName(fullPath.LibraryName())
+	fullPath := ShareBasePathFromPaths(PathOf(origin), path)
+	lib, err := r.LibraryByName(fullPath.Elem(0))
 	if err != nil {
 		return nil, errors.ErrorfWithCause(
 			err,
-			"failed to get library %q", fullPath.LibraryName())
+			"failed to get library %q", fullPath.Elem(0))
 	}
 	if _, err = lib.Library.NewFolder(c, fullPath[1:]...); err != nil {
 		return nil, errors.ErrorfWithCause(
@@ -125,7 +122,9 @@ func (r *Root) ObjectByPath(c *web.Client, origin Parent, path Path) (Object, er
 		origin = r
 	}
 	o := Object(origin)
-	for _, part := range path {
+	//for _, part := range path {
+	for i := 0; i < path.Len(); i++ {
+		part := path.Elem(i)
 		logger.Debug2("Getting child %q from parent %v...", part, PathOf(o))
 		p, ok := o.(Parent)
 		if !ok {

@@ -18,6 +18,10 @@ const (
 
 var (
 	logger = logging.GetLogger("github.com/skillian/sharebase")
+
+	// ErrUnauthorized is returned when the request results in a 401
+	// unauthorized response.
+	ErrUnauthorized = errors.New("unauthorized")
 )
 
 // Lener is implemented by types that have a Len method returning their

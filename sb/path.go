@@ -2,127 +2,175 @@ package main
 
 import (
 	"os"
+	"path"
+	"path/filepath"
+	"regexp"
 	"strings"
-
-	"github.com/skillian/errors"
 )
 
-const pathSep = string(os.PathSeparator)
+// PathSeparator is the separator used to describe paths in ShareBase from
+// this command.
+//
+// I know it's confusing because ShareBase's API actually uses backslashes like
+// Windows, but this command's implementation uses the forward slash because
+// ShareBase paths also use a made up URI format and URIs' paths use forward
+// slashes.
+const PathSeparator = "/"
 
-// Path for our needs is just a slice of strings where the first string is the
-// Library name, the last string is the Object's name and all the middle
-// strings are parent folders.
-type Path []string
+// Path is the interface implemented by all filesystem paths, either local
+// or in ShareBase.
+type Path interface {
+	// Dir gets the parent directory of this path.
+	Dir() Path
 
-// LocalPath creates a Path from the given local path.
-func LocalPath(value string) Path {
-	parts := strings.Split(value, string(os.PathSeparator))
-	// remove empty pieces:
-	d := 0
-	for i := 0; i < len(parts); i++ {
-		if parts[i] == "" {
-			d--
-			continue
-		}
-		parts[i+d] = parts[i]
-	}
-	return parts[:len(parts)+d]
+	// Elem gets a path element by its index.
+	Elem(index int) string
+
+	// Len gets the number of elements in the path.
+	Len() int
+
+	// String produces a string representation of the path.
+	String() string
 }
 
-// PathOf gets the path to the given object.  It does this by getting the
-// ParentsOf the object and reversing them, ommitting the Root.
-func PathOf(o Object) Path {
+// PathOf gets the ShareBasePath of the given ShareBase Object.  It builds this
+// path by traversing the object's parents.
+func PathOf(o Object) ShareBasePath {
 	parents := ParentsOf(o)
 	if len(parents) == 0 {
-		if r, ok := o.(*Root); !ok {
-			panic(errors.NewUnexpectedType(r, o))
-		}
-		return Path([]string{"/"})
+		return ShareBasePath{}
 	}
-	path := make(Path, len(parents))
+	parts := make([]string, len(parents))
 	for i, parent := range parents[:len(parents)-1] {
-		path[len(path)-2-i] = parent.Name()
+		parts[len(parts)-2-i] = parent.Name()
 	}
-	path[len(path)-1] = o.Name()
-	return path
+	parts[len(parts)-1] = o.Name()
+	return ShareBasePath(parts)
 }
 
-// ShareBasePath creates a Path from the given ShareBase path by splitting
-// the path by the ShareBase path separator.  If the ShareBase URI scheme
-// is at the beginning of the string, it is removed.  If the library name is
-// "my," it is expanded to the full true library name: "My Library."
-func ShareBasePath(value string) Path {
-	if strings.HasPrefix(value, shareBaseURIScheme) {
-		value = value[len(shareBaseURIScheme):]
+// Basename gets a path's base name (i.e. the last element of the path).
+func Basename(p Path) string {
+	length := p.Len()
+	if length == 0 {
+		return ""
 	}
-	parts := LocalPath(value)
-	if len(parts) > 0 {
-		if parts[0] == "my" {
-			parts[0] = "My Library"
+	return p.Elem(length - 1)
+}
+
+// LocalPath describes a path to somewhere on the local device's filesystem.
+type LocalPath []string
+
+// LocalPathFromString creates a LocalPath from the given path string.
+func LocalPathFromString(v string) LocalPath {
+	v = filepath.Clean(v)
+	return LocalPath(strings.Split(v, string(os.PathSeparator)))
+}
+
+// LocalPathFromPaths creates a single LocalPath from the given path parts
+// by joining them together.
+func LocalPathFromPaths(ps ...Path) LocalPath {
+	return LocalPath(joinPathElems(ps))
+}
+
+// Copy creates a copy of the LocalPath.
+func (p LocalPath) Copy() LocalPath {
+	p2 := make(LocalPath, len(p))
+	copy(p2, p)
+	return p2
+}
+
+// Dir implements the Path interface.
+func (p LocalPath) Dir() Path { return p[:len(p)-1] }
+
+// Elem implements the Path interface.
+func (p LocalPath) Elem(index int) string { return p[index] }
+
+// Len implements the Path interface.
+func (p LocalPath) Len() int { return len(p) }
+
+// String implements the Path interface.
+func (p LocalPath) String() string { return filepath.Join([]string(p)...) }
+
+// ShareBasePath describes a path to a ShareBase location.
+type ShareBasePath []string
+
+// ShareBasePathFromPaths creates a single ShareBasePath from the given path
+// parts by joining them together.
+func ShareBasePathFromPaths(ps ...Path) ShareBasePath {
+	return ShareBasePath(joinPathElems(ps))
+}
+
+// ShareBasePathFromString creates a ShareBasePath from the given string path.
+//
+// Note that unlike ShareBase's API, ShareBase paths in this program actually
+// use forward slashes.
+func ShareBasePathFromString(v string) ShareBasePath {
+	if strings.HasPrefix(v, shareBaseURIScheme) {
+		v = v[len(shareBaseURIScheme):]
+	}
+	v = path.Clean(v)
+	elems := strings.Split(v, PathSeparator)
+	if len(elems) > 0 {
+		if elems[0] == "my" {
+			elems[0] = "My Library"
 		}
 	}
-	return Path(parts)
+	for i, elem := range elems {
+		fixed := strings.Join(
+			allowedShareBaseRegexp.FindAllString(
+				elem, -1),
+			"")
+		if elem != fixed {
+			logger.Warn(
+				"invalid ShareBase path element: %q " +
+					"changed to: %q",
+				elem, fixed)
+			elems[i] = fixed
+		}
+	}
+	return ShareBasePath(elems)
 }
 
-// Dir gets the parent directory of the given path.
-func (p Path) Dir() Path {
-	length := len(p)
-	if length == 0 {
+var allowedShareBaseRegexp = regexp.MustCompile(
+	"[0-9A-Za-z_\\.\\-\\+ ]+")
+
+// Copy creates a copy of the ShareBasePath.
+func (p ShareBasePath) Copy() ShareBasePath {
+	p2 := make(ShareBasePath, len(p))
+	copy(p2, p)
+	return p2
+}
+
+// Dir implements the Path interface.
+func (p ShareBasePath) Dir() Path { return p[:len(p)-1] }
+
+// Elem implements the Path interface.
+func (p ShareBasePath) Elem(index int) string { return p[index] }
+
+// Len implements the Path interface.
+func (p ShareBasePath) Len() int { return len(p) }
+
+// String implements the Path interface.
+func (p ShareBasePath) String() string {
+	return shareBaseURIScheme + path.Join([]string(p)...)
+}
+
+func joinPathElems(ps []Path) []string {
+	if len(ps) == 0 {
 		return nil
 	}
-	return p[0 : length-1]
-}
-
-// Cmp compares two paths by comparing the strings within them, from first
-// to last.  If the paths are the same length and their strings compare equal,
-// 0 is returned.  If the prefixes of both paths match, Cmp returns the result
-// of comparing the paths lengths.
-func (p Path) Cmp(p2 Path) int {
-	min := len(p)
-	if len(p2) < min {
-		min = len(p2)
+	length := 0
+	for _, p := range ps {
+		length += p.Len()
 	}
-	for i, part := range p[:min] {
-		cmp := strings.Compare(part, p2[i])
-		if cmp != 0 {
-			return cmp
+	parts := make([]string, length)
+	i := 0
+	for _, p := range ps {
+		length = p.Len()
+		for j := 0; j < length; j++ {
+			parts[i] = p.Elem(j)
+			i++
 		}
 	}
-	if len(p) == len(p2) {
-		return 0
-	}
-	if min == len(p) {
-		return -1
-	}
-	return 1
-}
-
-// LibraryName gets the name of the library that holds the object with this
-// path.Folder
-func (p Path) LibraryName() string {
-	return p[0]
-}
-
-// Name gets the object's own name within the path.
-func (p Path) Name() string {
-	return p[len(p)-1]
-}
-
-// StartsWith determines if the given path starts with the given prefix.
-// StartsWith returns true if path and prefix are the same full path.
-func (p Path) StartsWith(prefix Path) bool {
-	if len(prefix) > len(p) {
-		return false
-	}
-	for i, part := range prefix {
-		if p[i] != part {
-			return false
-		}
-	}
-	return true
-}
-
-// String returns the string representation of the Path.
-func (p Path) String() string {
-	return strings.Join(p, pathSep)
+	return parts
 }

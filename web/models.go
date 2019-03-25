@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -449,7 +450,14 @@ func (w *DocumentWriter) patch() (err error) {
 // createNewLargeDocument posts a request for a temporary file in the folder
 // with the given name.
 func (f *Folder) createNewLargeDocument(c *Client, name string) (r NewLargeDocumentResponse, err error) {
-	err = c.requestJSON(http.MethodPost, Concat(f.Links.Self, "/temp?filename=", name), nil, &r)
+	err = c.requestJSON(
+		http.MethodPost,
+		Concat(
+			f.Links.Self,
+			"/temp?filename=",
+			url.QueryEscape(name)),
+		nil,
+		&r)
 	return
 }
 
@@ -488,6 +496,9 @@ type Document struct {
 
 	// DateModified stores the date that the Document was last modified.
 	DateModified time.Time
+
+	// Hash is a base-64 encoded SHA-1 hash of the file's contents.
+	Hash []byte
 
 	// Links holds links that the document has to other ShareBase objects.
 	Links DocumentLinks

@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/skillian/sharebase/web"
@@ -49,7 +52,7 @@ func main() {
 
 	flag.StringVar(
 		&configFilename, "c",
-		path.Join(my.HomeDir, defaultConfigFilename),
+		filepath.Join(my.HomeDir, defaultConfigFilename),
 		"ShareBase configuration file")
 
 	flag.StringVar(
@@ -67,6 +70,11 @@ func main() {
 		"Untar the input to write the files separately into "+
 			"ShareBase (useful if the source is coming from a "+
 			"stream).")
+
+	flag.BoolVar(
+		&s.Exec, "x", false,
+		"The [source] parameter is a command to execute instead of "+
+			"a source file/directory.")
 
 	flag.Usage = func() {
 		defaultUsage()
@@ -120,11 +128,14 @@ type state struct {
 	*Root
 	Config
 
+	Overwrite bool
+
 	Source string
 	Target string
 
 	Tar   bool
 	Untar bool
+	Exec  bool
 }
 
 func (s *state) client() (*web.Client, error) {
@@ -165,6 +176,20 @@ func (s *state) execute() error {
 	if err != nil {
 		return err
 	}
+	if s.Exec {
+		if !isShareBaseLoc(s.Target) {
+			return errors.Errorf(
+				"commands must execute on ShareBase objects.")
+		}
+		p := ShareBasePathFromString(s.Target)
+		o, err := s.Root.ObjectByPath(c, nil, p)
+		if err != nil {
+			return errors.ErrorfWithCause(
+				err,
+				"failed to get %v", p)
+		}
+		return s.execCommand(c, o)
+	}
 	if isShareBaseLoc(s.Source) {
 		if isShareBaseLoc(s.Target) {
 			return errors.Errorf(
@@ -174,7 +199,7 @@ func (s *state) execute() error {
 			return errors.Errorf(
 				"cannot untar from ShareBase source.")
 		}
-		p, base, err := s.Root.ParentByPath(c, nil, ShareBasePath(s.Source))
+		p, base, err := s.Root.ParentByPath(c, nil, ShareBasePathFromString(s.Source))
 		if err != nil {
 			return err
 		}
@@ -188,7 +213,7 @@ func (s *state) execute() error {
 		if s.Tar {
 			return errors.Errorf("cannot tar to ShareBase target.")
 		}
-		path := ShareBasePath(s.Target)
+		path := ShareBasePathFromString(s.Target)
 		logger.Debug("Path: %v", path)
 		p, base, err := s.Root.ParentByPath(c, nil, path)
 		if err != nil {
@@ -198,6 +223,71 @@ func (s *state) execute() error {
 	}
 	return errors.Errorf(
 		"do not use this client for local -> local transfers.")
+}
+
+func (s *state) execCommand(c *web.Client, o Object) error {
+	cmd := strings.ToLower(s.Source)
+	fn, ok := commands[cmd]
+	if !ok {
+		return errors.Errorf("unrecognized command: %q", cmd)
+	}
+	return fn(s, c, o)
+}
+
+var commands = map[string]func(s *state, c *web.Client, o Object) error{
+	"hash": (*state).hashDocument,
+	"ls":   (*state).listDirectory,
+}
+
+func (s *state) hashDocument(c *web.Client, o Object) error {
+	d, ok := o.(*Document)
+	if !ok {
+		return errors.Errorf(
+			"only %T can be hashed, not %T", d, o)
+	}
+	return writeObjectToList(d, os.Stdout)
+}
+
+func (s *state) listDirectory(c *web.Client, o Object) error {
+	p, ok := o.(Parent)
+	if !ok {
+		return errors.Errorf(
+			"%v is not a parent (it's a %T)", PathOf(p), p)
+	}
+	if err := p.update(s.Root, c); err != nil {
+		return errors.ErrorfWithCause(
+			err,
+			"failed to update ShareBase Folder %v", PathOf(p))
+	}
+	for _, ch := range p.Children() {
+		if err := writeObjectToList(ch, os.Stdout); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeObjectToList(o Object, w io.Writer) error {
+	var err error
+	t := reflect.TypeOf(o)
+	switch o := o.(type) {
+	case *Document:
+		_, err = fmt.Fprintf(
+			w,
+			"%s\tID: %d\t%s\t%s\t%s\n",
+			o.Name(),
+			o.ID(),
+			t.Name(),
+			o.DateModified.Format("2006-01-02 03:04:05 PM EST"),
+			getHex(o.Hash))
+		//	case *Folder:
+		//		_, err = fmt.Fprintf(
+		//			w, "%s\tID: %d\t%s\n", o.Name(), o.ID(), t.Name())
+	default:
+		_, err = fmt.Fprintf(
+			w, "%s\tID: %d\t%s\n", o.Name(), o.ID(), t.Name())
+	}
+	return err
 }
 
 func (s *state) localToShareBase(wc *web.Client, p Parent, name string) (err error) {
@@ -220,7 +310,7 @@ func (s *state) localToShareBase(wc *web.Client, p Parent, name string) (err err
 	if source != os.Stdin {
 		// Don't try the if-dir-exists behavior if we're reading
 		// from stdin.
-		if c, err := s.Root.ObjectByPath(wc, p, ShareBasePath(name)); err == nil {
+		if c, err := s.Root.ObjectByPath(wc, p, ShareBasePathFromString(name)); err == nil {
 			logger.Debug2("parent %q has child %q", PathOf(p), name)
 			if c, ok := c.(Parent); ok {
 				logger.Debug1("child %q is itself a parent", PathOf(c))
@@ -258,7 +348,7 @@ func (s *state) localToShareBase(wc *web.Client, p Parent, name string) (err err
 // folder structures.
 func (s *state) localDirToShareBaseDir(wc *web.Client, source *os.File, p Parent, name string) error {
 	logger.Debug2("parent: %v, name: %q", PathOf(p), name)
-	f, err := s.Root.GetOrCreateFolder(wc, p, ShareBasePath(name))
+	f, err := s.Root.GetOrCreateFolder(wc, p, ShareBasePathFromString(name))
 	if err != nil {
 		return errors.ErrorfWithCause(
 			err, "failed to create ShareBase folder")
@@ -307,7 +397,7 @@ func (s *state) localFileToShareBaseDir(c *web.Client, r io.Reader, f *Folder, n
 }
 
 func (s *state) localTarToShareBaseDir(wc *web.Client, r io.Reader, origin Parent, name string) error {
-	f, err := s.Root.GetOrCreateFolder(wc, origin, ShareBasePath(name))
+	f, err := s.Root.GetOrCreateFolder(wc, origin, ShareBasePathFromString(name))
 	if err != nil {
 		return errors.ErrorfWithCause(
 			err, "failed to create ShareBase folder")
@@ -324,14 +414,14 @@ func (s *state) localTarToShareBaseDir(wc *web.Client, r io.Reader, origin Paren
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:
-			_, err = s.Root.GetOrCreateFolder(wc, f, LocalPath(h.Name))
+			_, err = s.Root.GetOrCreateFolder(wc, f, LocalPathFromString(h.Name))
 			if err != nil {
 				return errors.ErrorfWithCause(
 					err,
 					"failed to create subdirectory")
 			}
 		case tar.TypeReg:
-			path := LocalPath(h.Name)
+			path := LocalPathFromString(h.Name)
 			f2, err := s.Root.GetOrCreateFolder(wc, f, path.Dir())
 			if err != nil {
 				return errors.ErrorfWithCause(
@@ -339,7 +429,7 @@ func (s *state) localTarToShareBaseDir(wc *web.Client, r io.Reader, origin Paren
 					"failed to get target directory %v: %v",
 					path.Dir(), err)
 			}
-			err = s.localFileToShareBaseDir(wc, t, f2, path.Name())
+			err = s.localFileToShareBaseDir(wc, t, f2, Basename(path))
 			if err != nil {
 				return errors.ErrorfWithCause(
 					err,
@@ -354,7 +444,7 @@ func (s *state) localTarToShareBaseDir(wc *web.Client, r io.Reader, origin Paren
 
 func (s *state) shareBaseToLocal(wc *web.Client, p Parent, name string) (err error) {
 	var o Object
-	o, err = s.Root.ObjectByPath(wc, p, ShareBasePath(name))
+	o, err = s.Root.ObjectByPath(wc, p, ShareBasePathFromString(name))
 	if err != nil {
 		return errors.ErrorfWithCause(
 			err,
@@ -362,26 +452,51 @@ func (s *state) shareBaseToLocal(wc *web.Client, p Parent, name string) (err err
 	}
 	p2, ok := o.(Parent)
 	target, err := s.getLocalTarget(ok && !s.Tar, name)
-	defer errors.WrapDeferred(&err, target.Close)
 	if err != nil {
 		return err
 	}
+	defer errors.WrapDeferred(&err, target.Close)
 	if ok {
 		if s.Tar {
 			return s.shareBaseDirToLocalTar(wc, p2)
 		}
-		return s.shareBaseDirToLocalDir(wc, p2, target.Name())
+		return s.shareBaseDirToLocalDir(wc, p2, LocalPathFromString(target.Name()))
 	}
 	return s.shareBaseFileToLocalFile(wc, o, target)
 }
 
-func (s *state) shareBaseDirToLocalDir(wc *web.Client, p Parent, target *os.File) error {
-	for _, c := range p.Children() {
-		switch c := c.(type) {
-		case Parent:
-
+func (s *state) shareBaseDirToLocalDir(wc *web.Client, p Parent, target LocalPath) error {
+	stat, err := os.Stat(target.String())
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err = os.Mkdir(s.Target, 0777); err != nil {
+				return errors.ErrorfWithCause(
+					err,
+					"failed to create target directory "+
+						"%q: %v",
+					s.Target, err)
+			}
+		} else {
+			return errors.ErrorfWithCause(
+				err,
+				"failed to create directory %q: %v",
+				target, err)
 		}
 	}
+	if !stat.IsDir() {
+		return errors.Errorf(
+			"target location %q exists but is not a directory",
+			target)
+	}
+	return errors.Errorf("not implemented")
+}
+
+func (s *state) shareBaseDirToLocalTar(wc *web.Client, p Parent) error {
+	panic("not implemented")
+}
+
+func (s *state) shareBaseFileToLocalFile(wc *web.Client, o Object, target *os.File) error {
+	panic("not implemented")
 }
 
 // getLocalTarget gets the local target file or directory.
@@ -411,6 +526,17 @@ func (s *state) getLocalTarget(container bool, name string) (*os.File, error) {
 	}
 	if st.IsDir() {
 		s.Target = path.Join(s.Target, name)
+		st, err = os.Stat(s.Target)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, errors.ErrorfWithCause(
+				err,
+				"failed to stat %q: %v", s.Target, err)
+		}
+	}
+	if !s.Overwrite && (err == nil || os.IsExist(err)) {
+		return nil, errors.ErrorfWithCause(
+			err,
+			"refusing to overwrite existing target %q")
 	}
 	return os.Create(s.Target)
 }
@@ -464,4 +590,17 @@ func mustGetCurrentUser() *user.User {
 			"failed to get current user: %v", err))
 	}
 	return u
+}
+
+func getHex(bs []byte) string {
+	var buffer bytes.Buffer
+	for _, b := range bs {
+		//		buffer.WriteString(fmt.Sprintf("%02x", b))
+		if _, err := fmt.Fprintf(&buffer, "%02x", b); err != nil {
+			panic(errors.ErrorfWithCause(
+				err,
+				"failed to print %#v with format %%02x", b))
+		}
+	}
+	return buffer.String()
 }
